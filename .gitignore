@@ -1,0 +1,13 @@
+*/*
+
+*.txt
+explore copy.ipynb
+*.pkl
+*.csv
+*.json
+*.jsonl
+utility copy 2.py
+# don'd add any .md files, recursively
+*.md
+
+# find . -name "*.md" -type f -exec git add -f {} +
