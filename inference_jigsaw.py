@@ -89,38 +89,40 @@ Is_DEBUG = False
 # hyperparameters
 lr = 1.5e-4
 clip = 1.0
-accumulation_steps = 16
-epochs = 2000 # if <10, fixed number of epochs; if >=10, fixed number of iterations
-onecycle_warmup_pct = 0.099572
+accumulation_steps = 32
+epochs = 1 # if <10, fixed number of epochs; if >=10, fixed number of iterations
+onecycle_warmup_pct = 0.071309
 cycle_momentum = False
 loss_bce_prob = 1 # prob for bce loss, 1 - prob for huber loss
-label_smoothing = 0.072503 # cannot be 0.0 for huber loss!
+label_smoothing = 0.001459 # cannot be 0.0 for huber loss!
 ss_weight = 0.0 # weight of semantic search logits in the final score
-embedding_normalize = True # normalize embeddings before semantic search
-ss_activate_fn = "softmax" # "sigmoid" or "softmax" or "tanh" or "none"
-temperature = 0.002272 # temperature for semantic search similarity
-delta = 2.432148 # for huber loss
+embedding_normalize = False # normalize embeddings before semantic search
+ss_activate_fn = "sigmoid" # "sigmoid" or "softmax" or "tanh" or "none"
+temperature = 0.001229 # temperature for semantic search similarity
+delta = 2.754083 # for huber loss
 NORMALIZE_PER_RULE = True
-DIVIDE_BY_STD = True # set True to divide by per-rule std after mean-centering
+DIVIDE_BY_STD = False # set True to divide by per-rule std after mean-centering
 EPS_STD = 1e-8
-weight_decay = 0.174505 # for AdamW
-n_aug, nmin, nmax, aug_p = 1, 1, 5, 0.054145 # for data augmentation
+weight_decay = 0.149086 # for AdamW
+n_aug, nmin, nmax, aug_p = 1, 2, 5, 0.003807 # for data augmentation
 max_uncertainty_iters = 4 # 7 hours on Kaggle
 uncertain_percent = [1.0, ] # ,0.85,0.5,0.25
 aggregate_fn_str = "median" # "mean" or "median" or "trimmed_mean", with max_uncertainty_iters = 1, all are the same.
-EARLY_STOP_PATIENCE_RATIO = 0.146658 # check performance every EARLY_STOP_PATIENCE_RATIO * total_steps
-DEFAULT_MODEL = "/rule_group_combined"
+EARLY_STOP_PATIENCE_RATIO = 500 # check performance every EARLY_STOP_PATIENCE_RATIO * total_steps
+DEFAULT_MODEL = "/model2"
 row_id_to_list_NORMALIZE = True
 start_train_layer = 0
-pred_entropy_percent = 0
+pred_entropy_percent = 0.085173
 pred_entropy_lr_scale = 0.1
 certain_percent = 0
-PL_lr_scale = 0.1
-normalize_text = False
-cross_rule_sample_pct = 0.224249 # 20% of negatives from other rules
-cross_rule_source = "neg" # "pos" or "neg"
+PL_lr_scale = 0.25
+normalize_text = True
+cross_rule_sample_pct = 0.495452 # 20% of negatives from other rules
+cross_rule_source = "pos" # "pos" or "neg"
 global_subset = False # for uncertain_df, pred_entropy_df, certain_df, whether to use global sorting or per-rule sorting
-autoregressive_weight = 0.1
+autoregressive_weight = 0.3269
+start_step = 40
+decay = 0.9
 # hyperparameters
 ss_weight *= max_uncertainty_iters # ss only done once while pure model done max_uncertainty_iters times
 if not global_subset:
@@ -219,7 +221,7 @@ def identify_easy_cases(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 # Heavy libraries are imported *inside* this function after GPU masking so that
 # each spawned worker only sees its assigned GPU.
 import re
-def freeze_early_lora_layers(model, start_train_layer: int, layer_regex= r"\.layers\.(\d+)\."):
+def freeze_early_lora_layers(model, start_train_layer: int, layer_regex= r"\.layers\.(\d+)\.", require_grad: bool = False):
     """
     Freeze LoRA params for layers with index < start_train_layer.
     Works with module names like: base_model.model.model.layers.30.self_attn.q_proj.lora_A.weight
@@ -232,7 +234,7 @@ def freeze_early_lora_layers(model, start_train_layer: int, layer_regex= r"\.lay
             continue
         layer_idx = int(m.group(1))
         if layer_idx < start_train_layer:
-            param.requires_grad_(False)
+            param.requires_grad_(require_grad)
 
 def _infer_on_split(
     split_df: pd.DataFrame,
@@ -303,7 +305,90 @@ def _infer_on_split(
     ###############################################################################################
     ##################### iterate over models and rules to train and infer ########################
     ###############################################################################################
-    def train_step(input_ids, length, labels, model, lm_head, optimizer, scheduler, loss_fn, i, tot_len):
+
+    # ema_lora.py
+    def default_lora_filter(name: str) -> bool:
+        """
+        Works with common PEFT/LoRA wraps:
+        - names typically contain: 'lora_', 'lora_A', 'lora_B', 'lora_down', 'lora_up'
+        """
+        n = name.lower()
+        return "lora_" in n
+
+    class LoRAEMA:
+        """
+        Exponential Moving Average tracker for LoRA parameters only.
+        - Keeps FP32 shadow weights
+        - Updates AFTER optimizer.step()
+        - Can swap in/out EMA weights for eval/export
+        """
+        def __init__(
+            self,
+            model,
+            decay: float = 0.99,
+            param_filter = default_lora_filter,
+            start_step: int = 0,
+        ):
+            assert 0.0 < decay < 1.0, "EMA decay should be in (0,1)."
+            self.model = model
+            self.decay = decay
+            self.param_filter = param_filter
+            self.start_step = start_step
+
+            # Select LoRA parameters (by name) and make FP32 shadow copies
+            self._named_params = {
+                name: p for name, p in model.named_parameters()
+                if p.requires_grad and param_filter(name)
+            }
+            if not self._named_params:
+                raise ValueError("No LoRA parameters found. Check your param_filter.")
+
+            self.shadow = {
+                n: p.detach().clone().float().to(p.device)
+                for n, p in self._named_params.items()
+            }
+            self._step: int = 0
+
+        @torch.no_grad()
+        def update(self) -> None:
+            """Update EMA shadows. Call AFTER optimizer.step()."""
+            self._step += 1
+            if self._step < self.start_step:
+                # Don't update EMA before start_step
+                return
+            
+            if self._step == self.start_step:
+                # Initialize shadow with current parameters at start_step
+                self.model_to_EMA()
+                return
+
+            d = self.decay
+            m = 1.0 - d
+            for n, p in self._named_params.items():
+                tgt = self.shadow[n]
+                tgt.mul_(d).add_(p.detach().float(), alpha=m)
+
+        @torch.no_grad()
+        def EMA_to_model(self) -> None:
+            for n, p in self._named_params.items():
+                p.copy_(self.shadow[n].to(dtype=p.dtype, device=p.device))
+
+        @torch.no_grad()
+        def model_to_EMA(self) -> None:
+            for n, p in self._named_params.items():
+                self.shadow[n].copy_(p.detach().float())
+
+        @property
+        def step(self) -> int:
+            return self._step
+
+        def to(self, device: torch.device) -> "LoRAEMA":
+            self.device = device
+            for k in self.shadow:
+                self.shadow[k] = self.shadow[k].to(device)
+            return self
+
+    def train_step(input_ids, length, labels, model, lm_head, optimizer, scheduler, loss_fn, i, tot_len, ema):
         with torch.amp.autocast(device_type='cuda', dtype=AMP_DTYPE):
             input_ids, length, labels = input_ids.to('cuda'), length.to('cuda'), torch.tensor(labels).to('cuda')
             labels = labels * (1 - label_smoothing) + (1 - labels) * label_smoothing
@@ -316,7 +401,7 @@ def _infer_on_split(
             
             # Autoregressive loss at all tokens
             # Shift targets: predict next token at each position
-            shift_logits = model.lm_head(output.last_hidden_state[:, :-1, :])  # (batch, seq_len-1, vocab_size) TODO: check model.lm_head
+            shift_logits = model.base_model.lm_head(output.last_hidden_state[:, :-1, :])
             shift_labels = input_ids[:, 1:]  # (batch, seq_len-1)
             
             # Flatten for cross-entropy loss
@@ -327,7 +412,7 @@ def _infer_on_split(
             autoregressive_loss = torch.nn.functional.cross_entropy(
                 shift_logits, 
                 shift_labels, 
-                ignore_index=pad_token_id, # TODO: collate_fn
+                ignore_index=151654,
             )
             
             # Combine losses (you can adjust the weight)
@@ -338,6 +423,7 @@ def _infer_on_split(
             if ((i + 1) % accumulation_steps == 0) or (i == tot_len):
                 clip_grad_norm_(trainable_params,clip)
                 optimizer.step()
+                ema.update()
                 try:
                     scheduler.step()
                 except:
@@ -364,6 +450,13 @@ def _infer_on_split(
         softplus_neg_abs = F.softplus(-abs_logits)
         entropy = softplus_neg_abs + abs_logits * exp_neg_abs / (1 + exp_neg_abs)
         return entropy.mean()
+    def zero_optimizer_state(optimizer):
+        # clear Adam/Lion/etc. internal stats
+        optimizer.state.clear()
+
+    def lr_backoff(optimizer, factor=0.7):
+        for g in optimizer.param_groups:
+            g["lr"] *= factor
 
     row_id_to_list = defaultdict(list) # row_id -> [logit1, logit2, ...]
     loo_auc_rule = dict() # rule -> auc
@@ -375,6 +468,7 @@ def _infer_on_split(
                 continue
             # load model and lm_head every time for different rules from LoRA folder
             model, lm_head = load_model_and_lm_head_from_folder(model, model_dir, device, is_trainable=True, lm_head=lm_head, torch_lib=torch, peft_model_class=PeftModel, fast_language_model=FastLanguageModel, Is_base_model=Is_base_model)
+            ema = LoRAEMA(model, decay=decay, start_step=start_step)
             freeze_early_lora_layers(model, start_train_layer=start_train_layer)
             Is_base_model = False
             # reset lm_head bias
@@ -409,14 +503,13 @@ def _infer_on_split(
                 pct_start=onecycle_warmup_pct,
                 anneal_strategy="cos",
                 cycle_momentum=cycle_momentum,
-                div_factor=10,
-                final_div_factor=100,
+                div_factor=2.5,
+                final_div_factor=8,
             )
             count = 0
             best_loss = float("inf")
             cur_loss = 0.0
             cur_examples = 0
-            EARLY_STOP = False
             check_freq = max(1, int(total_steps * accumulation_steps * micro_bs * EARLY_STOP_PATIENCE_RATIO)) \
                             if isinstance(EARLY_STOP_PATIENCE_RATIO, float) else EARLY_STOP_PATIENCE_RATIO
             next_check = check_freq
@@ -425,7 +518,7 @@ def _infer_on_split(
                 for _ in range(epochs):
                     for i, (input_ids, length, _, labels) in enumerate(train_dataloader):
                         count += len(labels)
-                        cur_loss += train_step(input_ids, length, labels, model, lm_head, optimizer, scheduler, loss_fn, i, tot_len)
+                        cur_loss += train_step(input_ids, length, labels, model, lm_head, optimizer, scheduler, loss_fn, i, tot_len, ema)
                         cur_examples += len(labels)
                         if count >= next_check:
                             if cur_examples > 0:
@@ -436,17 +529,17 @@ def _infer_on_split(
                                     cur_examples = 0
                                     next_check += check_freq
                                 else:
-                                    EARLY_STOP = True
-                                    break
+                                    ema.EMA_to_model() # restore last EMA weights
+                                    lr_backoff(optimizer)
+                                    zero_optimizer_state(optimizer)
                             else:
                                 next_check += check_freq
-                    if EARLY_STOP:
-                        break
+
             else: # fixed number of iterations
                 while True:
                     for i, (input_ids, length, _, labels) in enumerate(train_dataloader):
                         count += len(labels)
-                        cur_loss += train_step(input_ids, length, labels, model, lm_head, optimizer, scheduler, loss_fn, i, tot_len)
+                        cur_loss += train_step(input_ids, length, labels, model, lm_head, optimizer, scheduler, loss_fn, i, tot_len, ema)
                         cur_examples += len(labels)
                         if count >= next_check:
                             if cur_examples > 0:
@@ -457,13 +550,14 @@ def _infer_on_split(
                                     cur_examples = 0
                                     next_check += check_freq
                                 else:
-                                    EARLY_STOP = True
-                                    break
+                                    ema.EMA_to_model() # restore last EMA weights
+                                    lr_backoff(optimizer)
+                                    zero_optimizer_state(optimizer)
                             else:
                                 next_check += check_freq
                         if count >= (6 if Is_toy else epochs):
                             break
-                    if count >= (6 if Is_toy else epochs) or EARLY_STOP:                 
+                    if count >= (6 if Is_toy else epochs):                 
                         break
 
             # psuedo label training
@@ -471,6 +565,7 @@ def _infer_on_split(
                 PL_rule_df = certain_df[certain_df["rule"] == rule]
                 if PL_rule_df.shape[0] > 0:
                     torch.nn.init.constant_(lm_head.bias, PL_rule_df['target'].mean())
+                    freeze_early_lora_layers(model, start_train_layer=12, require_grad=False)
                     PL_dataset = TTTDataset_map(PL_rule_df, tokenizer, rule_variants, random_truncate=True, return_target=True)
                     PL_dataloader = DataLoader(PL_dataset, batch_size=2, collate_fn=_collate_fn, shuffle=True)
                     trainable_params = [param for param in model.parameters() if param.requires_grad] + [param for param in lm_head.parameters() if param.requires_grad]
@@ -514,8 +609,9 @@ def _infer_on_split(
                                 optimizer.step()
                                 optimizer.zero_grad()
 
-
+            freeze_early_lora_layers(model, start_train_layer=12, require_grad=True)
             ############# inference #############
+            ema.EMA_to_model()
             FastLanguageModel.for_inference(model)
             model.eval()
             if need_ss:
@@ -836,7 +932,7 @@ if __name__ == "__main__":
     for iter_idx in range(max_uncertainty_iters):
         clear_cache()
         # TODO: normalize predictions? per rule uncertainty?
-        if iter_idx == 0:
+        if iter_idx <= 1: # only after 2 models ensemble
             uncertain_df = test_df
             pred_entropy_df = None
             certain_df = None
